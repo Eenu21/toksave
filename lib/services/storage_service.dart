@@ -11,6 +11,8 @@ import '../models/tiktok_creator.dart';
 import '../models/tiktok_creator_page.dart';
 import '../models/tiktok_download_option.dart';
 import '../models/download_record.dart';
+import '../models/frequent_creator.dart';
+import '../models/recent_video.dart';
 import '../models/saved_creator.dart';
 import '../models/tiktok_video.dart';
 
@@ -24,7 +26,7 @@ class StorageService {
     final path = p.join(dbPath, 'toksave.db');
     _database = await openDatabase(
       path,
-      version: 4,
+      version: 5,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE downloads (
@@ -44,6 +46,7 @@ class StorageService {
           )
         ''');
         await _createCreatorsTable(db);
+        await _createRecentTables(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
@@ -78,6 +81,9 @@ class StorageService {
             GROUP BY authorId
           ''');
         }
+        if (oldVersion < 5) {
+          await _createRecentTables(db);
+        }
       },
     );
   }
@@ -95,6 +101,32 @@ class StorageService {
     ''');
   }
 
+  Future<void> _createRecentTables(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE recent_videos (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        author TEXT NOT NULL,
+        thumbnailUrl TEXT NOT NULL DEFAULT '',
+        sourceUrl TEXT NOT NULL,
+        authorId TEXT NOT NULL DEFAULT '',
+        authorAvatarUrl TEXT NOT NULL DEFAULT '',
+        durationSeconds INTEGER NOT NULL DEFAULT 0,
+        lastViewedAt INTEGER NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE creator_visits (
+        username TEXT PRIMARY KEY,
+        displayName TEXT NOT NULL,
+        avatarUrl TEXT NOT NULL DEFAULT '',
+        profileUrl TEXT NOT NULL,
+        visitCount INTEGER NOT NULL DEFAULT 0,
+        lastVisitedAt INTEGER NOT NULL
+      )
+    ''');
+  }
+
   Future<List<DownloadRecord>> loadDownloads() async {
     final db = _database;
     if (db == null) {
@@ -107,7 +139,10 @@ class StorageService {
     return rows.map((row) => DownloadRecord.fromMap(row)).toList();
   }
 
-  Future<void> saveDownload(DownloadRecord record) async {
+  Future<void> saveDownload(
+    DownloadRecord record, {
+    required TikTokVideo video,
+  }) async {
     final database = _database!;
     await database.transaction((txn) async {
       await txn.insert(
@@ -116,26 +151,47 @@ class StorageService {
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
       final username = record.authorId.replaceFirst(RegExp(r'^@'), '').trim();
-      if (username.isEmpty) return;
-
-      final existing = await txn.query(
-        'saved_creators',
-        columns: ['downloadCount'],
-        where: 'username = ?',
-        whereArgs: [username],
-        limit: 1,
-      );
-      final count = existing.isEmpty
-          ? 1
-          : (existing.first['downloadCount'] as int) + 1;
-      await txn.insert('saved_creators', {
-        'username': username,
-        'displayName': record.author,
-        'avatarUrl': record.authorAvatarUrl,
-        'profileUrl': 'https://www.tiktok.com/@$username',
-        'lastDownloadedAt': record.downloadedAt.millisecondsSinceEpoch,
-        'downloadCount': count,
+      if (username.isNotEmpty &&
+          !record.author.startsWith('http') &&
+          record.author != 'Unknown creator') {
+        final existing = await txn.query(
+          'saved_creators',
+          columns: ['downloadCount'],
+          where: 'username = ?',
+          whereArgs: [username],
+          limit: 1,
+        );
+        final count = existing.isEmpty
+            ? 1
+            : (existing.first['downloadCount'] as int) + 1;
+        await txn.insert('saved_creators', {
+          'username': username,
+          'displayName': record.author,
+          'avatarUrl': record.authorAvatarUrl,
+          'profileUrl': 'https://www.tiktok.com/@$username',
+          'lastDownloadedAt': record.downloadedAt.millisecondsSinceEpoch,
+          'downloadCount': count,
+        }, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+      await txn.insert('recent_videos', {
+        'id': video.id,
+        'title': video.title,
+        'author': video.author,
+        'thumbnailUrl': video.thumbnailUrl,
+        'sourceUrl': video.sourceUrl,
+        'authorId': video.authorId,
+        'authorAvatarUrl': video.authorAvatarUrl,
+        'durationSeconds': video.durationSeconds,
+        'lastViewedAt': record.downloadedAt.millisecondsSinceEpoch,
       }, conflictAlgorithm: ConflictAlgorithm.replace);
+      await txn.rawDelete('''
+        DELETE FROM recent_videos
+        WHERE id NOT IN (
+          SELECT id FROM recent_videos
+          ORDER BY lastViewedAt DESC
+          LIMIT 30
+        )
+      ''');
     });
   }
 
@@ -145,6 +201,95 @@ class StorageService {
       orderBy: 'lastDownloadedAt DESC',
     );
     return rows.map(SavedCreator.fromMap).toList(growable: false);
+  }
+
+  Future<void> saveRecentVideo(TikTokVideo video) async {
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    await _database!.transaction((txn) async {
+      await txn.insert('recent_videos', {
+        'id': video.id,
+        'title': video.title,
+        'author': video.author,
+        'thumbnailUrl': video.thumbnailUrl,
+        'sourceUrl': video.sourceUrl,
+        'authorId': video.authorId,
+        'authorAvatarUrl': video.authorAvatarUrl,
+        'durationSeconds': video.durationSeconds,
+        'lastViewedAt': timestamp,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+      await txn.rawDelete('''
+        DELETE FROM recent_videos
+        WHERE id NOT IN (
+          SELECT id FROM recent_videos
+          ORDER BY lastViewedAt DESC
+          LIMIT 30
+        )
+      ''');
+    });
+  }
+
+  Future<List<RecentVideo>> loadRecentVideos() async {
+    final rows = await _database!.query(
+      'recent_videos',
+      orderBy: 'lastViewedAt DESC',
+      limit: 12,
+    );
+    return rows.map(RecentVideo.fromMap).toList(growable: false);
+  }
+
+  Future<FrequentCreator> recordCreatorVisit({
+    required String username,
+    required String displayName,
+    required String avatarUrl,
+  }) async {
+    final normalizedUsername = username.replaceFirst(RegExp(r'^@'), '').trim();
+    if (normalizedUsername.isEmpty) {
+      throw const AppException(
+        message: 'The TikTok creator could not be identified.',
+        userMessage: 'Couldn\'t identify this creator.',
+      );
+    }
+
+    final now = DateTime.now();
+    return _database!.transaction((txn) async {
+      final existing = await txn.query(
+        'creator_visits',
+        columns: ['visitCount', 'avatarUrl'],
+        where: 'username = ?',
+        whereArgs: [normalizedUsername],
+        limit: 1,
+      );
+      final visitCount = existing.isEmpty
+          ? 1
+          : (existing.first['visitCount'] as int) + 1;
+      final existingAvatar = existing.isEmpty
+          ? ''
+          : existing.first['avatarUrl'] as String;
+      await txn.insert('creator_visits', {
+        'username': normalizedUsername,
+        'displayName': displayName,
+        'avatarUrl': avatarUrl.isNotEmpty ? avatarUrl : existingAvatar,
+        'profileUrl': 'https://www.tiktok.com/@$normalizedUsername',
+        'visitCount': visitCount,
+        'lastVisitedAt': now.millisecondsSinceEpoch,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+      final rows = await txn.query(
+        'creator_visits',
+        where: 'username = ?',
+        whereArgs: [normalizedUsername],
+        limit: 1,
+      );
+      return FrequentCreator.fromMap(rows.single);
+    });
+  }
+
+  Future<List<FrequentCreator>> loadFrequentCreators() async {
+    final rows = await _database!.query(
+      'creator_visits',
+      orderBy: 'visitCount DESC, lastVisitedAt DESC',
+      limit: 12,
+    );
+    return rows.map(FrequentCreator.fromMap).toList(growable: false);
   }
 
   Future<void> deleteDownload(String id) async {
@@ -222,18 +367,14 @@ class StorageService {
 
     final response = await _post(
       Uri.parse('https://www.tikwm.com/api/user/posts/'),
-      {
-        'unique_id': '@$normalizedUsername',
-        'count': '12',
-        'cursor': cursor ?? '0',
-      },
+      {'unique_id': normalizedUsername, 'count': '12', 'cursor': cursor ?? '0'},
       timeoutMessage: 'Creator videos request timed out.',
     );
     if (response.statusCode == 403) {
       throw const AppException(
         message: 'TikWM returned HTTP 403 for creator videos.',
         userMessage:
-            'TikWM is refusing creator-list requests (HTTP 403). The provider used by the other app may be different.',
+            'TikWM is refusing public creator-video lists (HTTP 403). You can still add video links below to build a batch.',
       );
     }
     if (response.statusCode != 200 || response.body.isEmpty) {

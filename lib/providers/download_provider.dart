@@ -11,6 +11,8 @@ import '../core/errors/app_exception.dart';
 import '../core/utils/url_utils.dart';
 import '../models/download_progress.dart';
 import '../models/download_record.dart';
+import '../models/frequent_creator.dart';
+import '../models/recent_video.dart';
 import '../models/saved_creator.dart';
 import '../models/tiktok_creator.dart';
 import '../models/tiktok_download_option.dart';
@@ -28,6 +30,8 @@ class DownloadProvider extends ChangeNotifier {
   final http.Client _downloadClient = http.Client();
   final List<DownloadRecord> _downloads = <DownloadRecord>[];
   final List<SavedCreator> _savedCreators = <SavedCreator>[];
+  final List<RecentVideo> _recentVideos = <RecentVideo>[];
+  final List<FrequentCreator> _frequentCreators = <FrequentCreator>[];
   bool _isLoading = false;
   bool _isBusy = false;
   bool _isCancelled = false;
@@ -46,6 +50,10 @@ class DownloadProvider extends ChangeNotifier {
       List<DownloadRecord>.unmodifiable(_downloads);
   List<SavedCreator> get savedCreators =>
       List<SavedCreator>.unmodifiable(_savedCreators);
+  List<RecentVideo> get recentVideos =>
+      List<RecentVideo>.unmodifiable(_recentVideos);
+  List<FrequentCreator> get frequentCreators =>
+      List<FrequentCreator>.unmodifiable(_frequentCreators);
   bool get isLoading => _isLoading;
   bool get isBusy => _isBusy;
   DownloadProgress get currentProgress => _currentProgress;
@@ -69,17 +77,34 @@ class DownloadProvider extends ChangeNotifier {
     try {
       final records = await _storageService.loadDownloads();
       final creators = await _storageService.loadSavedCreators();
+      final recentVideos = await _storageService.loadRecentVideos();
+      final frequentCreators = await _storageService.loadFrequentCreators();
       _downloads
         ..clear()
         ..addAll(records);
       _savedCreators
         ..clear()
         ..addAll(creators);
+      _recentVideos
+        ..clear()
+        ..addAll(recentVideos);
+      _frequentCreators
+        ..clear()
+        ..addAll(frequentCreators);
       _latestDownload = records.isNotEmpty ? records.first : null;
     } finally {
       _isLoading = false;
       notifyListeners();
     }
+  }
+
+  void _rememberRecentVideo(RecentVideo video) {
+    _recentVideos.removeWhere((item) => item.id == video.id);
+    _recentVideos.insert(0, video);
+    if (_recentVideos.length > 12) {
+      _recentVideos.removeRange(12, _recentVideos.length);
+    }
+    notifyListeners();
   }
 
   void _rememberCreator(DownloadRecord record) {
@@ -124,14 +149,71 @@ class DownloadProvider extends ChangeNotifier {
             'Couldn\'t retrieve this video. Please check the link and try again.',
       );
     }
+    await _storageService.saveRecentVideo(result);
+    _rememberRecentVideo(
+      RecentVideo(
+        id: result.id,
+        title: result.title,
+        author: result.author,
+        thumbnailUrl: result.thumbnailUrl,
+        sourceUrl: result.sourceUrl,
+        authorId: result.authorId,
+        authorAvatarUrl: result.authorAvatarUrl,
+        durationSeconds: result.durationSeconds,
+        lastViewedAt: DateTime.now(),
+      ),
+    );
     return result;
   }
 
-  Future<void> loadCreatorVideos(TikTokVideo seedVideo) async {
-    final username = seedVideo.authorId.isEmpty
-        ? seedVideo.author
-        : seedVideo.authorId;
-    final normalizedUsername = username.replaceFirst(RegExp(r'^@'), '');
+  Future<void> recordCreatorVisit({
+    required String username,
+    required String displayName,
+    required String avatarUrl,
+  }) async {
+    final creator = await _storageService.recordCreatorVisit(
+      username: username,
+      displayName: displayName,
+      avatarUrl: avatarUrl,
+    );
+    _frequentCreators.removeWhere(
+      (item) => item.username.toLowerCase() == creator.username.toLowerCase(),
+    );
+    _frequentCreators.add(creator);
+    _frequentCreators.sort((a, b) {
+      final countOrder = b.visitCount.compareTo(a.visitCount);
+      return countOrder != 0
+          ? countOrder
+          : b.lastVisitedAt.compareTo(a.lastVisitedAt);
+    });
+    if (_frequentCreators.length > 12) {
+      _frequentCreators.removeRange(12, _frequentCreators.length);
+    }
+    notifyListeners();
+  }
+
+  Future<void> loadCreatorVideos({
+    TikTokVideo? seedVideo,
+    String? username,
+    String? displayName,
+    String? avatarUrl,
+  }) async {
+    final creatorUsername =
+        username ??
+        (seedVideo == null
+            ? ''
+            : seedVideo.authorId.isEmpty
+            ? seedVideo.author
+            : seedVideo.authorId);
+    final normalizedUsername = creatorUsername
+        .replaceFirst(RegExp(r'^@'), '')
+        .trim();
+    if (normalizedUsername.isEmpty) {
+      throw const AppException(
+        message: 'The TikTok creator could not be identified.',
+        userMessage: 'Couldn\'t identify this creator.',
+      );
+    }
     if (_loadedCreatorUsername == normalizedUsername &&
         _creatorVideos.isNotEmpty) {
       return;
@@ -139,25 +221,28 @@ class DownloadProvider extends ChangeNotifier {
     _isLoadingCreator = true;
     _creator = TikTokCreator(
       username: normalizedUsername,
-      displayName: seedVideo.author,
-      avatarUrl: seedVideo.authorAvatarUrl,
+      displayName: displayName ?? seedVideo?.author ?? normalizedUsername,
+      avatarUrl: avatarUrl ?? seedVideo?.authorAvatarUrl ?? '',
     );
     _creatorVideos = [];
     _creatorCursor = null;
     _creatorHasMore = false;
     notifyListeners();
     try {
-      final page = await _storageService.fetchCreatorVideos(username: username);
+      final page = await _storageService.fetchCreatorVideos(
+        username: creatorUsername,
+      );
       _creator = page.creator;
       _creatorVideos = List<TikTokVideo>.of(page.videos);
-      if (!_creatorVideos.any((video) => video.id == seedVideo.id)) {
+      if (seedVideo != null &&
+          !_creatorVideos.any((video) => video.id == seedVideo.id)) {
         _creatorVideos.insert(0, seedVideo);
       }
       _creatorCursor = page.nextCursor;
       _creatorHasMore = page.hasMore;
       _loadedCreatorUsername = normalizedUsername;
     } on AppException {
-      _creatorVideos = [seedVideo];
+      if (seedVideo != null) _creatorVideos = [seedVideo];
       rethrow;
     } finally {
       _isLoadingCreator = false;
@@ -360,9 +445,22 @@ class DownloadProvider extends ChangeNotifier {
         authorAvatarUrl: video.authorAvatarUrl,
       );
 
-      await _storageService.saveDownload(record);
+      await _storageService.saveDownload(record, video: video);
       savedToHistory = true;
       _rememberCreator(record);
+      _rememberRecentVideo(
+        RecentVideo(
+          id: video.id,
+          title: video.title,
+          author: video.author,
+          thumbnailUrl: video.thumbnailUrl,
+          sourceUrl: video.sourceUrl,
+          authorId: video.authorId,
+          authorAvatarUrl: video.authorAvatarUrl,
+          durationSeconds: video.durationSeconds,
+          lastViewedAt: record.downloadedAt,
+        ),
+      );
       _downloads.insert(0, record);
       _latestDownload = record;
       _currentProgress = DownloadProgress(

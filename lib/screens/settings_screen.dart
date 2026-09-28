@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import '../core/constants/app_constants.dart';
 import '../providers/settings_provider.dart';
+import 'legal_info_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -13,19 +13,32 @@ class SettingsScreen extends StatelessWidget {
     final settings = context.watch<SettingsProvider>();
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Settings'),
-      ),
+      appBar: AppBar(title: const Text('Settings')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          const Text('Appearance', style: TextStyle(fontWeight: FontWeight.w700)),
+          const Text(
+            'Appearance',
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
           const SizedBox(height: 12),
           SegmentedButton<ThemeMode>(
             segments: const [
-              ButtonSegment(value: ThemeMode.system, label: Text('System'), icon: Icon(Icons.brightness_auto_rounded)),
-              ButtonSegment(value: ThemeMode.light, label: Text('Light'), icon: Icon(Icons.light_mode_rounded)),
-              ButtonSegment(value: ThemeMode.dark, label: Text('Dark'), icon: Icon(Icons.dark_mode_rounded)),
+              ButtonSegment(
+                value: ThemeMode.system,
+                label: Text('System'),
+                icon: Icon(Icons.brightness_auto_rounded),
+              ),
+              ButtonSegment(
+                value: ThemeMode.light,
+                label: Text('Light'),
+                icon: Icon(Icons.light_mode_rounded),
+              ),
+              ButtonSegment(
+                value: ThemeMode.dark,
+                label: Text('Dark'),
+                icon: Icon(Icons.dark_mode_rounded),
+              ),
             ],
             selected: <ThemeMode>{settings.themeMode},
             onSelectionChanged: (values) async {
@@ -33,7 +46,10 @@ class SettingsScreen extends StatelessWidget {
             },
           ),
           const SizedBox(height: 24),
-          const Text('Downloads', style: TextStyle(fontWeight: FontWeight.w700)),
+          const Text(
+            'Downloads',
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
           const SizedBox(height: 12),
           SwitchListTile(
             title: const Text('Wi‑Fi only'),
@@ -43,7 +59,9 @@ class SettingsScreen extends StatelessWidget {
           ),
           SwitchListTile(
             title: const Text('Auto-save'),
-            subtitle: const Text('Automatically save and track every download.'),
+            subtitle: const Text(
+              'Automatically save and track every download.',
+            ),
             value: settings.autoSave,
             onChanged: (value) async => settings.setAutoSave(value),
           ),
@@ -58,12 +76,12 @@ class SettingsScreen extends StatelessWidget {
           ListTile(
             leading: const Icon(Icons.privacy_tip_outlined),
             title: const Text('Privacy Policy'),
-            onTap: () => _openUrl(kPrivacyUrl),
+            onTap: () => _openLegalInfo(context, LegalDocument.privacy),
           ),
           ListTile(
             leading: const Icon(Icons.description_outlined),
             title: const Text('Terms of Use'),
-            onTap: () => _openUrl(kTermsUrl),
+            onTap: () => _openLegalInfo(context, LegalDocument.terms),
           ),
           ListTile(
             leading: const Icon(Icons.info_outline_rounded),
@@ -73,36 +91,30 @@ class SettingsScreen extends StatelessWidget {
           ListTile(
             leading: const Icon(Icons.balance_rounded),
             title: const Text('Open-source licenses'),
-            onTap: () => showLicensePage(context: context),
+            onTap: () => showLicensePage(
+              context: context,
+              applicationName: kAppName,
+              applicationVersion: '1.0.1BETA',
+              applicationLegalese:
+                  'Third-party package licenses used by TokSave.',
+            ),
           ),
           ListTile(
             leading: const Icon(Icons.app_registration_rounded),
             title: const Text('Version'),
-            subtitle: const Text('1.0.0'),
-          ),
-          const SizedBox(height: 24),
-          const Text('Support', style: TextStyle(fontWeight: FontWeight.w700)),
-          ListTile(
-            leading: const Icon(Icons.bug_report_outlined),
-            title: const Text('Report a problem'),
-            onTap: () => _openUrl('https://example.com/support'),
-          ),
-          ListTile(
-            leading: const Icon(Icons.email_outlined),
-            title: const Text('Contact developer'),
-            onTap: () => _openUrl('mailto:$kSupportEmail'),
+            subtitle: const Text('1.0.1BETA'),
           ),
         ],
       ),
     );
   }
 
-  Future<void> _openUrl(String url) async {
-    final uri = Uri.tryParse(url);
-    if (uri == null) return;
-    if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-      throw Exception('Could not open URL');
-    }
+  void _openLegalInfo(BuildContext context, LegalDocument document) {
+    Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => LegalInfoScreen(document: document),
+      ),
+    );
   }
 
   Future<void> _showLocationDialog(BuildContext context) async {
@@ -116,7 +128,10 @@ class SettingsScreen extends StatelessWidget {
           decoration: const InputDecoration(hintText: 'Movies/TokSave'),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
           TextButton(
             onPressed: () => Navigator.pop(context, controller.text),
             child: const Text('Save'),
@@ -134,8 +149,9 @@ class SettingsScreen extends StatelessWidget {
     showAboutDialog(
       context: context,
       applicationName: kAppName,
-      applicationVersion: '1.0.0',
-      applicationLegalese: 'TokSave is an original app for downloading videos when legally permitted. Use only with permission and respect platform rules.',
+      applicationVersion: '1.0.1BETA',
+      applicationLegalese:
+          'TokSave is an original app for downloading videos when legally permitted. Use only with permission and respect platform rules.',
     );
   }
 }

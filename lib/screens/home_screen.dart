@@ -1,16 +1,15 @@
 import 'dart:async';
-import 'dart:io';
-
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
-import 'package:share_plus/share_plus.dart';
 
 import '../core/constants/app_constants.dart';
 import '../core/errors/app_exception.dart';
 import '../core/utils/url_utils.dart';
+import '../models/frequent_creator.dart';
+import '../models/recent_video.dart';
 import '../models/tiktok_download_option.dart';
 import '../models/tiktok_video.dart';
 import '../providers/download_provider.dart';
@@ -31,12 +30,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final TextEditingController _controller = TextEditingController();
   final AdsService _adsService = AdsService(enabled: true);
   final SharingService _sharingService = SharingService();
+  Timer? _autoFetchTimer;
   TikTokVideo? _video;
   TikTokDownloadFormat? _selectedFormat;
   bool _isLoading = false;
   bool _hasClipboardUrl = false;
   bool _downloadComplete = false;
   String? _errorMessage;
+  String? _lastAutoFetchUrl;
+  int _lookupGeneration = 0;
 
   @override
   void initState() {
@@ -56,6 +58,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _autoFetchTimer?.cancel();
     _controller.dispose();
     super.dispose();
   }
@@ -64,9 +67,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     try {
       final clipboard = await Clipboard.getData('text/plain');
       final text = clipboard?.text ?? '';
-      if (text.trim().isNotEmpty && isTikTokUrl(text) && mounted) {
+      if (text.trim().isNotEmpty && isTikTokVideoUrl(text) && mounted) {
+        _onVideoUrlChanged(text, fromClipboard: true);
         setState(() {
-          _hasClipboardUrl = true;
           _controller.text = text;
         });
       }
@@ -86,9 +89,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       }
       setState(() {
         _controller.text = text;
-        _hasClipboardUrl = isTikTokUrl(text);
-        _errorMessage = null;
       });
+      _onVideoUrlChanged(text, fromClipboard: true);
     } catch (_) {
       if (mounted) {
         setState(() => _errorMessage = 'Could not read your clipboard.');
@@ -102,10 +104,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _errorMessage = 'Please paste a TikTok URL first.');
       return;
     }
+    if (!isTikTokVideoUrl(url)) {
+      setState(
+        () => _errorMessage = 'Paste a TikTok video link, not a profile link.',
+      );
+      return;
+    }
 
+    _autoFetchTimer?.cancel();
+    final lookupGeneration = ++_lookupGeneration;
     final provider = context.read<DownloadProvider>();
     final connectivityResult = await Connectivity().checkConnectivity();
-    if (!mounted) return;
+    if (!mounted || lookupGeneration != _lookupGeneration) return;
     if (connectivityResult.contains(ConnectivityResult.none)) {
       setState(() => _errorMessage = 'No internet connection.');
       return;
@@ -119,26 +129,61 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     try {
       final video = await provider.resolveVideo(url);
-      if (!mounted) return;
+      if (!mounted || lookupGeneration != _lookupGeneration) return;
       setState(() {
         _video = video;
         _selectedFormat = video.downloadOptions.first.format;
         _isLoading = false;
       });
     } on AppException catch (error) {
-      if (!mounted) return;
+      if (!mounted || lookupGeneration != _lookupGeneration) return;
       setState(() {
         _isLoading = false;
         _errorMessage = error.userMessage ?? error.message;
       });
     } catch (_) {
-      if (!mounted) return;
+      if (!mounted || lookupGeneration != _lookupGeneration) return;
       setState(() {
         _isLoading = false;
         _errorMessage =
             'Could not retrieve this video. Check the link and try again.';
       });
     }
+  }
+
+  void _onVideoUrlChanged(String value, {bool fromClipboard = false}) {
+    final url = value.trim();
+    final isVideoUrl = isTikTokVideoUrl(url);
+    _lookupGeneration++;
+    _autoFetchTimer?.cancel();
+    if (!isVideoUrl) _lastAutoFetchUrl = null;
+
+    setState(() {
+      _errorMessage = null;
+      _hasClipboardUrl = fromClipboard && isVideoUrl;
+      _downloadComplete = false;
+      _isLoading = false;
+      if (_video != null && normalizeTikTokUrl(url) != _video!.sourceUrl) {
+        _video = null;
+        _selectedFormat = null;
+      }
+    });
+    if (isVideoUrl) _scheduleAutomaticLookup(url);
+  }
+
+  void _scheduleAutomaticLookup(String rawUrl) {
+    final url = normalizeTikTokUrl(rawUrl);
+    if (!isTikTokVideoUrl(url) || url == _lastAutoFetchUrl) return;
+    _autoFetchTimer?.cancel();
+    _autoFetchTimer = Timer(const Duration(milliseconds: 650), () {
+      if (!mounted ||
+          normalizeTikTokUrl(_controller.text) != url ||
+          _isLoading) {
+        return;
+      }
+      _lastAutoFetchUrl = url;
+      unawaited(_fetchVideo());
+    });
   }
 
   Future<void> _downloadVideo(DownloadProvider provider) async {
@@ -174,6 +219,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _openCreatorProfile(TikTokVideo video) async {
+    try {
+      final provider = context.read<DownloadProvider>();
+      await provider.recordCreatorVisit(
+        username: video.authorId.isEmpty ? video.author : video.authorId,
+        displayName: video.author,
+        avatarUrl: video.authorAvatarUrl,
+      );
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not update creator history.')),
+        );
+      }
+    }
+    if (!mounted) return;
     await Navigator.of(context).push<void>(
       MaterialPageRoute<void>(
         builder: (_) => CreatorProfileScreen(seedVideo: video),
@@ -186,6 +246,245 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   String _sizeLabel(int bytes) =>
       bytes > 0 ? '~${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB' : '';
+
+  Future<void> _openRecentVideo(RecentVideo video) async {
+    _controller.text = video.sourceUrl;
+    await _fetchVideo();
+  }
+
+  Future<void> _openFrequentCreator(FrequentCreator creator) async {
+    try {
+      final provider = context.read<DownloadProvider>();
+      await provider.recordCreatorVisit(
+        username: creator.username,
+        displayName: creator.displayName,
+        avatarUrl: creator.avatarUrl,
+      );
+      if (!mounted) return;
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (_) => CreatorProfileScreen(
+            creatorUsername: creator.username,
+            creatorDisplayName: creator.displayName,
+            creatorAvatarUrl: creator.avatarUrl,
+          ),
+        ),
+      );
+      if (mounted) await provider.refreshDownloads();
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not open this creator profile.')),
+        );
+      }
+    }
+  }
+
+  Widget _sectionHeading(ThemeData theme, String title, String subtitle) =>
+      Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: theme.textTheme.titleLarge?.copyWith(
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              subtitle,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      );
+
+  Widget _buildRecentVideos(ThemeData theme, DownloadProvider provider) {
+    final videos = provider.recentVideos.take(8).toList();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _sectionHeading(
+          theme,
+          'Recent videos',
+          'Your checked links are saved on this device',
+        ),
+        if (videos.isEmpty)
+          _HomeEmptyCard(
+            theme: theme,
+            icon: Icons.history_rounded,
+            message: 'Videos you check will show up here for quick access.',
+          )
+        else
+          SizedBox(
+            height: 202,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: videos.length,
+              separatorBuilder: (_, _) => const SizedBox(width: 12),
+              itemBuilder: (context, index) {
+                final video = videos[index];
+                return SizedBox(
+                  width: 154,
+                  child: Card(
+                    clipBehavior: Clip.antiAlias,
+                    child: InkWell(
+                      onTap: () => _openRecentVideo(video),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Stack(
+                            children: [
+                              CachedNetworkImage(
+                                imageUrl: video.thumbnailUrl,
+                                width: double.infinity,
+                                height: 112,
+                                fit: BoxFit.cover,
+                                placeholder: (_, _) => Container(
+                                  color:
+                                      theme.colorScheme.surfaceContainerHighest,
+                                  child: const Center(
+                                    child: Icon(Icons.video_file_rounded),
+                                  ),
+                                ),
+                                errorWidget: (_, _, _) => Container(
+                                  color:
+                                      theme.colorScheme.surfaceContainerHighest,
+                                  child: const Center(
+                                    child: Icon(Icons.video_file_rounded),
+                                  ),
+                                ),
+                              ),
+                              Positioned(
+                                right: 8,
+                                bottom: 8,
+                                child: DecoratedBox(
+                                  decoration: BoxDecoration(
+                                    color: Colors.black.withValues(alpha: 0.68),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 7,
+                                      vertical: 4,
+                                    ),
+                                    child: Text(
+                                      formatDuration(video.durationSeconds),
+                                      style: theme.textTheme.labelSmall
+                                          ?.copyWith(color: Colors.white),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
+                            child: Text(
+                              video.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.labelLarge?.copyWith(
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(10, 2, 10, 8),
+                            child: Text(
+                              video.author,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildFrequentCreators(ThemeData theme, DownloadProvider provider) {
+    final creators = provider.frequentCreators.take(8).toList();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _sectionHeading(
+          theme,
+          'Frequently visited',
+          'Creators whose profiles you open',
+        ),
+        if (creators.isEmpty)
+          _HomeEmptyCard(
+            theme: theme,
+            icon: Icons.people_outline_rounded,
+            message: 'Open a creator profile and it will be remembered here.',
+          )
+        else
+          SizedBox(
+            height: 122,
+            child: ListView.separated(
+              scrollDirection: Axis.horizontal,
+              itemCount: creators.length,
+              separatorBuilder: (_, _) => const SizedBox(width: 18),
+              itemBuilder: (context, index) {
+                final creator = creators[index];
+                return SizedBox(
+                  width: 78,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(18),
+                    onTap: () => _openFrequentCreator(creator),
+                    child: Column(
+                      children: [
+                        CircleAvatar(
+                          radius: 30,
+                          backgroundColor:
+                              theme.colorScheme.surfaceContainerHighest,
+                          backgroundImage: creator.avatarUrl.isEmpty
+                              ? null
+                              : CachedNetworkImageProvider(creator.avatarUrl),
+                          child: creator.avatarUrl.isEmpty
+                              ? const Icon(Icons.person_rounded)
+                              : null,
+                        ),
+                        const SizedBox(height: 7),
+                        Text(
+                          creator.displayName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          textAlign: TextAlign.center,
+                          style: theme.textTheme.labelMedium?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        Text(
+                          '${creator.visitCount} visits',
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+      ],
+    );
+  }
 
   Widget _buildVideoOptions(ThemeData theme, DownloadProvider provider) {
     final video = _video!;
@@ -383,52 +682,103 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final provider = context.watch<DownloadProvider>();
-    final downloads = provider.downloads.take(3).toList();
 
     return Scaffold(
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 28),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const SizedBox(height: 12),
-              Center(
-                child: Column(
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(18),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [
+                      theme.colorScheme.primaryContainer,
+                      theme.colorScheme.surfaceContainerHighest,
+                    ],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: BorderRadius.circular(26),
+                ),
+                child: Row(
                   children: [
-                    const AppLogo(size: 72),
-                    const SizedBox(height: 16),
-                    Text(
-                      kAppName,
-                      style: theme.textTheme.headlineMedium?.copyWith(
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      kAppTagline,
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
+                    const AppLogo(size: 54),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Welcome to $kAppName',
+                            style: theme.textTheme.titleLarge?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            kAppTagline,
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ],
                 ),
               ),
-              const SizedBox(height: 24),
+              const SizedBox(height: 22),
               Text(
-                'Paste a TikTok video link',
-                style: theme.textTheme.titleMedium?.copyWith(
-                  fontWeight: FontWeight.w700,
+                'Download a video',
+                style: theme.textTheme.titleLarge?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Paste a public TikTok link to get started.',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
                 ),
               ),
               const SizedBox(height: 12),
-              UrlInputField(
-                controller: _controller,
-                onPaste: _pasteFromClipboard,
-                onChanged: (_) => setState(() {
-                  _errorMessage = null;
-                  _hasClipboardUrl = false;
-                }),
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    children: [
+                      UrlInputField(
+                        controller: _controller,
+                        onPaste: _pasteFromClipboard,
+                        onChanged: _onVideoUrlChanged,
+                      ),
+                      const SizedBox(height: 12),
+                      SizedBox(
+                        width: double.infinity,
+                        child: FilledButton.icon(
+                          onPressed: _isLoading ? null : _fetchVideo,
+                          icon: _isLoading
+                              ? const SizedBox.square(
+                                  dimension: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.search_rounded),
+                          label: Text(
+                            _isLoading
+                                ? 'Checking link...'
+                                : 'Get video details',
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
               if (_hasClipboardUrl) ...[
                 const SizedBox(height: 8),
@@ -444,22 +794,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ],
                 ),
               ],
-              const SizedBox(height: 14),
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed: _isLoading ? null : _fetchVideo,
-                  icon: _isLoading
-                      ? const SizedBox.square(
-                          dimension: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.search_rounded),
-                  label: Text(
-                    _isLoading ? 'Checking link...' : 'Get video details',
-                  ),
-                ),
-              ),
               if (_errorMessage != null) ...[
                 const SizedBox(height: 12),
                 Container(
@@ -482,70 +816,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 _buildVideoOptions(theme, provider),
               ],
               const SizedBox(height: 24),
-              Row(
-                children: [
-                  Expanded(
-                    child: Divider(color: theme.colorScheme.outlineVariant),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                    child: Text(
-                      'Recent downloads',
-                      style: theme.textTheme.titleSmall?.copyWith(
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                  Expanded(
-                    child: Divider(color: theme.colorScheme.outlineVariant),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              if (downloads.isEmpty)
-                const Text('No downloads yet.')
-              else
-                ...downloads.map(
-                  (record) => Card(
-                    child: ListTile(
-                      leading: record.mediaType == 'audio'
-                          ? const Icon(Icons.music_note_rounded)
-                          : ClipRRect(
-                              borderRadius: BorderRadius.circular(10),
-                              child: record.thumbnailUrl.isEmpty
-                                  ? const Icon(Icons.video_library_rounded)
-                                  : Image.file(
-                                      File(record.filePath),
-                                      width: 52,
-                                      height: 52,
-                                      fit: BoxFit.cover,
-                                      errorBuilder: (_, _, _) => const Icon(
-                                        Icons.broken_image_rounded,
-                                      ),
-                                    ),
-                            ),
-                      title: Text(
-                        record.title,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      subtitle: Text(
-                        record.downloadedAt.toLocal().toString().split(' ')[0],
-                      ),
-                      trailing: IconButton(
-                        onPressed: () => SharePlus.instance.share(
-                          ShareParams(
-                            files: [XFile(record.filePath)],
-                            text: 'Downloaded from TokSave',
-                          ),
-                        ),
-                        icon: const Icon(Icons.share_rounded),
-                      ),
-                    ),
-                  ),
-                ),
+              _buildRecentVideos(theme, provider),
+              const SizedBox(height: 22),
+              _buildFrequentCreators(theme, provider),
               if (_video != null) ...[
-                const SizedBox(height: 20),
+                const SizedBox(height: 22),
                 _buildRecommendedCreator(theme),
               ],
               const SizedBox(height: 16),
@@ -569,4 +844,30 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       ),
     );
   }
+}
+
+class _HomeEmptyCard extends StatelessWidget {
+  const _HomeEmptyCard({
+    required this.theme,
+    required this.icon,
+    required this.message,
+  });
+
+  final ThemeData theme;
+  final IconData icon;
+  final String message;
+
+  @override
+  Widget build(BuildContext context) => Card(
+    child: Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+      child: Row(
+        children: [
+          Icon(icon, color: theme.colorScheme.primary),
+          const SizedBox(width: 12),
+          Expanded(child: Text(message, style: theme.textTheme.bodyMedium)),
+        ],
+      ),
+    ),
+  );
 }

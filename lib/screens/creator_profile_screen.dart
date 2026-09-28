@@ -5,14 +5,25 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../core/errors/app_exception.dart';
 import '../core/utils/url_utils.dart';
+import '../models/download_record.dart';
+import '../models/recent_video.dart';
 import '../models/tiktok_download_option.dart';
 import '../models/tiktok_video.dart';
 import '../providers/download_provider.dart';
 
 class CreatorProfileScreen extends StatefulWidget {
-  const CreatorProfileScreen({super.key, required this.seedVideo});
+  const CreatorProfileScreen({
+    super.key,
+    this.seedVideo,
+    this.creatorUsername,
+    this.creatorDisplayName,
+    this.creatorAvatarUrl,
+  }) : assert(seedVideo != null || creatorUsername != null);
 
-  final TikTokVideo seedVideo;
+  final TikTokVideo? seedVideo;
+  final String? creatorUsername;
+  final String? creatorDisplayName;
+  final String? creatorAvatarUrl;
 
   @override
   State<CreatorProfileScreen> createState() => _CreatorProfileScreenState();
@@ -32,9 +43,10 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
   @override
   void initState() {
     super.initState();
-    _format = widget.seedVideo.downloadOptions.isEmpty
+    final seedVideo = widget.seedVideo;
+    _format = seedVideo == null || seedVideo.downloadOptions.isEmpty
         ? null
-        : widget.seedVideo.downloadOptions.first.format;
+        : seedVideo.downloadOptions.first.format;
     WidgetsBinding.instance.addPostFrameCallback((_) => _loadProfile());
   }
 
@@ -46,9 +58,21 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
 
   Future<void> _loadProfile() async {
     try {
-      await context.read<DownloadProvider>().loadCreatorVideos(
-        widget.seedVideo,
+      final provider = context.read<DownloadProvider>();
+      await provider.loadCreatorVideos(
+        seedVideo: widget.seedVideo,
+        username: widget.creatorUsername,
+        displayName: widget.creatorDisplayName,
+        avatarUrl: widget.creatorAvatarUrl,
       );
+      if (mounted && _format == null) {
+        final firstOption = provider.creatorVideos
+            .expand((video) => video.downloadOptions)
+            .firstOrNull;
+        if (firstOption != null) {
+          setState(() => _format = firstOption.format);
+        }
+      }
     } on AppException catch (error) {
       if (mounted) {
         setState(() => _loadError = error.userMessage ?? error.message);
@@ -65,7 +89,20 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
   Future<void> _retryProfile(DownloadProvider provider) async {
     setState(() => _loadError = null);
     try {
-      await provider.loadCreatorVideos(widget.seedVideo);
+      await provider.loadCreatorVideos(
+        seedVideo: widget.seedVideo,
+        username: widget.creatorUsername,
+        displayName: widget.creatorDisplayName,
+        avatarUrl: widget.creatorAvatarUrl,
+      );
+      if (mounted && _format == null) {
+        final firstOption = provider.creatorVideos
+            .expand((video) => video.downloadOptions)
+            .firstOrNull;
+        if (firstOption != null) {
+          setState(() => _format = firstOption.format);
+        }
+      }
     } on AppException catch (error) {
       if (mounted) {
         setState(() => _loadError = error.userMessage ?? error.message);
@@ -91,6 +128,240 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
       for (final video in _importedVideos) video.id: video,
     };
     return videos.values.toList(growable: false);
+  }
+
+  String _username(DownloadProvider provider) =>
+      (provider.creator?.username ??
+              widget.creatorUsername ??
+              widget.seedVideo?.authorId ??
+              '')
+          .replaceFirst(RegExp(r'^@'), '')
+          .trim()
+          .toLowerCase();
+
+  bool _matchesCreator({
+    required String username,
+    required String authorId,
+    required String sourceUrl,
+  }) {
+    if (username.isEmpty) return false;
+    final normalizedAuthor = authorId.replaceFirst(RegExp(r'^@'), '');
+    if (normalizedAuthor.isNotEmpty) {
+      return normalizedAuthor.toLowerCase() == username;
+    }
+    final uri = Uri.tryParse(sourceUrl);
+    if (uri == null) return false;
+    for (final segment in uri.pathSegments) {
+      if (segment.startsWith('@')) {
+        return segment.substring(1).toLowerCase() == username;
+      }
+    }
+    return false;
+  }
+
+  List<DownloadRecord> _savedCreatorVideos(DownloadProvider provider) {
+    final username = _username(provider);
+    return provider.downloads
+        .where(
+          (record) =>
+              record.mediaType != 'audio' &&
+              _matchesCreator(
+                username: username,
+                authorId: record.authorId,
+                sourceUrl: record.originalUrl,
+              ),
+        )
+        .toList(growable: false);
+  }
+
+  List<RecentVideo> _recentCreatorVideos(DownloadProvider provider) {
+    final username = _username(provider);
+    final savedUrls = _savedCreatorVideos(provider)
+        .map((record) => record.originalUrl)
+        .where((url) => url.isNotEmpty)
+        .toSet();
+    return provider.recentVideos
+        .where(
+          (video) =>
+              !savedUrls.contains(video.sourceUrl) &&
+              _matchesCreator(
+                username: username,
+                authorId: video.authorId,
+                sourceUrl: video.sourceUrl,
+              ),
+        )
+        .toList(growable: false);
+  }
+
+  Future<void> _addLinkToBatch(String url, DownloadProvider provider) async {
+    try {
+      final video = await provider.resolveVideo(url);
+      if (!mounted) return;
+      if (_allVideos(provider).any((item) => item.id == video.id)) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('This video is already in the batch.')),
+        );
+        return;
+      }
+      setState(() {
+        _importedVideos.add(video);
+        _format ??= video.downloadOptions.first.format;
+        _selectedIds.add(video.id);
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Video added and selected for the batch.'),
+        ),
+      );
+    } on AppException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.userMessage ?? error.message)),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not add this video to the batch.'),
+          ),
+        );
+      }
+    }
+  }
+
+  Widget _buildHistoryVideoTile({
+    required ThemeData theme,
+    required String title,
+    required String subtitle,
+    required String thumbnailUrl,
+    required String sourceUrl,
+    required DownloadProvider provider,
+    required bool alreadyDownloaded,
+  }) {
+    return Card(
+      margin: const EdgeInsets.only(top: 8),
+      child: Padding(
+        padding: const EdgeInsets.all(10),
+        child: Row(
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: thumbnailUrl.isEmpty
+                  ? Container(
+                      width: 58,
+                      height: 58,
+                      color: theme.colorScheme.surfaceContainerHighest,
+                      child: const Icon(Icons.video_file_rounded),
+                    )
+                  : CachedNetworkImage(
+                      imageUrl: thumbnailUrl,
+                      width: 58,
+                      height: 58,
+                      fit: BoxFit.cover,
+                      errorWidget: (_, _, _) => Container(
+                        width: 58,
+                        height: 58,
+                        color: theme.colorScheme.surfaceContainerHighest,
+                        child: const Icon(Icons.video_file_rounded),
+                      ),
+                    ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    subtitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  if (sourceUrl.isNotEmpty)
+                    TextButton.icon(
+                      onPressed: provider.isLoadingCreator
+                          ? null
+                          : () => _addLinkToBatch(sourceUrl, provider),
+                      icon: const Icon(Icons.playlist_add_rounded, size: 18),
+                      label: Text(
+                        alreadyDownloaded
+                            ? 'Add link to batch again'
+                            : 'Add to batch',
+                      ),
+                      style: TextButton.styleFrom(
+                        padding: EdgeInsets.zero,
+                        minimumSize: const Size(0, 32),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildLocalCreatorVideos(
+    ThemeData theme,
+    DownloadProvider provider,
+    List<DownloadRecord> savedVideos,
+    List<RecentVideo> recentVideos,
+  ) {
+    if (savedVideos.isEmpty && recentVideos.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'From this device',
+          style: theme.textTheme.titleLarge?.copyWith(
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        Text(
+          'Previously downloaded or checked videos from this creator.',
+          style: theme.textTheme.bodySmall,
+        ),
+        for (final record in savedVideos)
+          _buildHistoryVideoTile(
+            theme: theme,
+            title: record.title,
+            subtitle:
+                'Already downloaded • ${formatBytes(record.fileSizeBytes)}',
+            thumbnailUrl: record.thumbnailUrl,
+            sourceUrl: record.originalUrl,
+            provider: provider,
+            alreadyDownloaded: true,
+          ),
+        for (final video in recentVideos)
+          _buildHistoryVideoTile(
+            theme: theme,
+            title: video.title,
+            subtitle: 'Recently checked • ${video.author}',
+            thumbnailUrl: video.thumbnailUrl,
+            sourceUrl: video.sourceUrl,
+            provider: provider,
+            alreadyDownloaded: false,
+          ),
+        const SizedBox(height: 16),
+      ],
+    );
   }
 
   Future<void> _importVideoLinks(DownloadProvider provider) async {
@@ -195,7 +466,11 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
   }
 
   Future<void> _openTikTokProfile(DownloadProvider provider) async {
-    final username = provider.creator?.username ?? widget.seedVideo.authorId;
+    final username =
+        provider.creator?.username ??
+        widget.seedVideo?.authorId ??
+        widget.creatorUsername ??
+        '';
     if (username.isEmpty) return;
     final uri = Uri.https('www.tiktok.com', '/@$username');
     final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
@@ -273,10 +548,18 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
         )
         .toList(growable: false);
     final videos = _availableVideos(provider);
+    final savedCreatorVideos = _savedCreatorVideos(provider);
+    final recentCreatorVideos = _recentCreatorVideos(provider);
     final selectedCount = videos
         .where((video) => _selectedIds.contains(video.id))
         .length;
     final size = _selectedSize(provider);
+    final fallbackName =
+        widget.creatorDisplayName ?? widget.seedVideo?.author ?? '';
+    final fallbackUsername =
+        widget.creatorUsername ?? widget.seedVideo?.authorId ?? '';
+    final fallbackAvatar =
+        widget.creatorAvatarUrl ?? widget.seedVideo?.authorAvatarUrl ?? '';
 
     return Scaffold(
       appBar: AppBar(title: const Text('Creator profile')),
@@ -295,18 +578,13 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
                           CircleAvatar(
                             radius: 38,
                             backgroundImage:
-                                (creator?.avatarUrl ??
-                                        widget.seedVideo.authorAvatarUrl)
-                                    .isEmpty
+                                (creator?.avatarUrl ?? fallbackAvatar).isEmpty
                                 ? null
                                 : CachedNetworkImageProvider(
-                                    creator?.avatarUrl ??
-                                        widget.seedVideo.authorAvatarUrl,
+                                    creator?.avatarUrl ?? fallbackAvatar,
                                   ),
                             child:
-                                (creator?.avatarUrl ??
-                                        widget.seedVideo.authorAvatarUrl)
-                                    .isEmpty
+                                (creator?.avatarUrl ?? fallbackAvatar).isEmpty
                                 ? const Icon(Icons.person_rounded, size: 38)
                                 : null,
                           ),
@@ -316,14 +594,13 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text(
-                                  creator?.displayName ??
-                                      widget.seedVideo.author,
+                                  creator?.displayName ?? fallbackName,
                                   style: theme.textTheme.titleLarge?.copyWith(
                                     fontWeight: FontWeight.w700,
                                   ),
                                 ),
                                 Text(
-                                  '@${creator?.username ?? widget.seedVideo.authorId}',
+                                  '@${creator?.username ?? fallbackUsername}',
                                   style: theme.textTheme.bodyMedium,
                                 ),
                                 if ((creator?.signature ?? '').isNotEmpty)
@@ -342,14 +619,14 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
                   ),
                   const SizedBox(height: 16),
                   Text(
-                    'Public videos',
+                    'Videos ready for batch',
                     style: theme.textTheme.titleLarge?.copyWith(
                       fontWeight: FontWeight.w700,
                     ),
                   ),
                   Text(
                     '${_allVideos(provider).length} '
-                    '${_allVideos(provider).length == 1 ? 'video' : 'videos'} available',
+                    '${_allVideos(provider).length == 1 ? 'video' : 'videos'} in the batch list',
                   ),
                   if (_loadError != null) ...[
                     const SizedBox(height: 12),
@@ -384,6 +661,12 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
                       ],
                     ),
                   ],
+                  _buildLocalCreatorVideos(
+                    theme,
+                    provider,
+                    savedCreatorVideos,
+                    recentCreatorVideos,
+                  ),
                   Card(
                     child: Padding(
                       padding: const EdgeInsets.all(14),
@@ -398,7 +681,7 @@ class _CreatorProfileScreenState extends State<CreatorProfileScreen> {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            'If the profile feed cannot load, paste video links from TikTok here, one per line. They will be added to the batch list.',
+                            'If TikTok video listings are blocked, paste video links here, one per line. TokSave can also recheck videos saved on this device and add them to the batch list.',
                             style: theme.textTheme.bodySmall,
                           ),
                           const SizedBox(height: 10),

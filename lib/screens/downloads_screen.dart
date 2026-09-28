@@ -1,12 +1,11 @@
-import 'dart:io';
-
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:video_player/video_player.dart';
 
 import '../core/utils/url_utils.dart';
 import '../providers/download_provider.dart';
+import '../widgets/video_player_dialog.dart';
 
 class DownloadsScreen extends StatefulWidget {
   const DownloadsScreen({super.key});
@@ -56,25 +55,22 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                         ClipRRect(
                           borderRadius: BorderRadius.circular(12),
                           child: record.mediaType == 'audio'
-                              ? Container(
-                                  width: 90,
-                                  height: 90,
-                                  color:
-                                      theme.colorScheme.surfaceContainerHighest,
-                                  child: const Icon(Icons.music_note_rounded),
+                              ? _DownloadThumbnail(
+                                  theme: theme,
+                                  icon: Icons.music_note_rounded,
                                 )
-                              : Image.file(
-                                  File(record.filePath),
+                              : CachedNetworkImage(
+                                  imageUrl: record.thumbnailUrl,
                                   width: 90,
                                   height: 90,
                                   fit: BoxFit.cover,
-                                  errorBuilder: (_, _, _) => Container(
-                                    width: 90,
-                                    height: 90,
-                                    color: theme
-                                        .colorScheme
-                                        .surfaceContainerHighest,
-                                    child: const Icon(Icons.video_file_rounded),
+                                  placeholder: (_, _) => _DownloadThumbnail(
+                                    theme: theme,
+                                    icon: Icons.video_file_rounded,
+                                  ),
+                                  errorWidget: (_, _, _) => _DownloadThumbnail(
+                                    theme: theme,
+                                    icon: Icons.video_file_rounded,
                                   ),
                                 ),
                         ),
@@ -100,31 +96,15 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
                                   IconButton.outlined(
                                     onPressed: record.mediaType == 'audio'
                                         ? null
-                                        : () async {
-                                            final controller =
-                                                VideoPlayerController.file(
-                                                  File(record.filePath),
-                                                );
-                                            await controller.initialize();
-                                            if (!context.mounted) {
-                                              await controller.dispose();
-                                              return;
-                                            }
-                                            await showDialog(
-                                              context: context,
-                                              builder: (_) => Dialog(
-                                                child: AspectRatio(
-                                                  aspectRatio: controller
-                                                      .value
-                                                      .aspectRatio,
-                                                  child: VideoPlayer(
-                                                    controller,
-                                                  ),
+                                        : () => showDialog<void>(
+                                            context: context,
+                                            barrierDismissible: false,
+                                            builder: (_) =>
+                                                VideoPlayerDialog.file(
+                                                  filePath: record.filePath,
+                                                  title: record.title,
                                                 ),
-                                              ),
-                                            );
-                                            await controller.dispose();
-                                          },
+                                          ),
                                     icon: Icon(
                                       record.mediaType == 'audio'
                                           ? Icons.music_note_rounded
@@ -160,4 +140,19 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
             ),
     );
   }
+}
+
+class _DownloadThumbnail extends StatelessWidget {
+  const _DownloadThumbnail({required this.theme, required this.icon});
+
+  final ThemeData theme;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    width: 90,
+    height: 90,
+    color: theme.colorScheme.surfaceContainerHighest,
+    child: Icon(icon),
+  );
 }

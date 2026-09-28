@@ -23,6 +23,21 @@ bool isTikTokUrl(String rawUrl) {
   return host == 'tiktok.com' || host.endsWith('.tiktok.com');
 }
 
+bool isTikTokVideoUrl(String rawUrl) {
+  final value = normalizeTikTokUrl(rawUrl);
+  final uri = Uri.tryParse(value);
+  if (uri == null || !isTikTokUrl(value)) return false;
+
+  final host = uri.host.toLowerCase();
+  if (host == 'vm.tiktok.com' || host == 'vt.tiktok.com') return true;
+
+  final segments = uri.pathSegments;
+  if (segments.length >= 3 && segments[0].startsWith('@')) {
+    return segments[1] == 'video' && RegExp(r'^\d+$').hasMatch(segments[2]);
+  }
+  return segments.length >= 2 && segments[0] == 't' && segments[1].isNotEmpty;
+}
+
 String sanitizeFileName(String title) {
   final safe = title.replaceAll(RegExp(r'[^a-zA-Z0-9 _-]'), '').trim();
   return safe.isEmpty ? 'tiktok-video' : safe;

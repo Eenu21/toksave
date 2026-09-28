@@ -1,11 +1,11 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import '../core/utils/url_utils.dart';
 import '../models/saved_creator.dart';
 import '../providers/download_provider.dart';
+import 'creator_profile_screen.dart';
 
 class SavedCreatorsScreen extends StatefulWidget {
   const SavedCreatorsScreen({super.key});
@@ -16,20 +16,39 @@ class SavedCreatorsScreen extends StatefulWidget {
 
 class _SavedCreatorsScreenState extends State<SavedCreatorsScreen> {
   Future<void> _openCreator(SavedCreator creator) async {
-    final uri = Uri.tryParse(creator.profileUrl);
-    if (uri == null || !isTikTokUrl(creator.profileUrl)) {
+    if (!isTikTokUrl(creator.profileUrl)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('This creator profile link is invalid.')),
       );
       return;
     }
 
-    final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
-    if (!opened && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not open this TikTok profile.')),
+    final provider = context.read<DownloadProvider>();
+    try {
+      await provider.recordCreatorVisit(
+        username: creator.username,
+        displayName: creator.displayName,
+        avatarUrl: creator.avatarUrl,
       );
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not update creator history.')),
+        );
+      }
+      return;
     }
+    if (!mounted) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => CreatorProfileScreen(
+          creatorUsername: creator.username,
+          creatorDisplayName: creator.displayName,
+          creatorAvatarUrl: creator.avatarUrl,
+        ),
+      ),
+    );
+    if (mounted) await provider.refreshDownloads();
   }
 
   String _dateLabel(DateTime date) {
